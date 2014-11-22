@@ -1,0 +1,394 @@
+#! /bin/sh
+# by pts@fazekas.hu at Sat Nov 22 13:59:40 CET 2014
+
+""":" #reap: Run processes with fatal signal propagation and/or timeout.
+
+type python2.7 >/dev/null 2>&1 && exec python2.7 -- "$0" ${1+"$@"}
+type python2.6 >/dev/null 2>&1 && exec python2.6 -- "$0" ${1+"$@"}
+type python2.5 >/dev/null 2>&1 && exec python2.5 -- "$0" ${1+"$@"}
+type python2.4 >/dev/null 2>&1 && exec python2.4 -- "$0" ${1+"$@"}
+exec python -- ${1+"$@"}; exit 1
+
+reap is a tool for Unix systems which can run subprocess trees and abort all
+processes at once if necessary. Aborting means sending a signal (usually
+SIGTERM or SIGALRM) to all processes in the tree, and if that doesn't cause
+them to die in a couple of seconds, sending SIGKILL to the rest of them.
+Abortion occurs by reap receiving SIGINT (e.g. Ctrl-<C>), SIGQUIT (e.g.
+Ctrl-<Backslash>), SIGTERM or SIGALRM, or with a timeout from the start
+of the reap process (implemented using SIGALRM).
+
+Please note that reap is configurable with command-line flags, so there are
+many other use cases in addition to those presented below.
+
+Use cases
+~~~~~~~~~
+Use case 1: Terminate subprocesses with Ctrl-<C>
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+If you run `prog arg1 arg2' in a shell command-line, and prog runs prog1,
+prog2 and prog3 sequentially, and prog2 ignores SIGINT, then pressing
+Ctrl-<C> while prog2 is running, may not abort all of the running programs
+(i.e. prog and prog2). For example, if prog is a shell script (e.g.
+/bin/bash, /bin/dash, /bin/zsh) or prog is running prog2 with system(3)
+(which is os.system in Python), then prog itself is ignoring SIGINT and
+SIGQUIT while running prog2, and since prog2 also ignores SIGINT, nothing
+will happen if you press Ctrl-<C> while prog2 is running.
+
+The solution: run `reap prog arg1 arg2' instead. reap will run `prog' (and
+its subprocesses) in a new pross group, and whenever reap receives a SIGINT
+(or SIGQUIT or SIGTERM), it will send a SIGTERM to all processes in the
+process group (i.e. prog and prog2), and those processes which are not
+ignoring the SIGTERM will die quickly. reap will wait 1 second from now and
+kill the rest of the processes in the precess group for good with SIGKILL.
+
+If you forgot specifying `reap' in the command-line, and Ctrl-<C> didn't
+kill everything, then -- as a workaround -- press Ctrl-<Z>, and in the
+prompt appearing, type and run:
+
+  kill %% && fg
+
+This will send SIGTERM to all processes. If they still haven't exited, press
+Ctrl-<Z> again, and type and run:
+
+  kill -9 %% && fg
+
+This will send SIGKILL.
+
+Use case 2: Kill dangling subprocesses
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+When a program runs another program as a child, and the parent exits
+(e.g. because it aborts on a fatal signal), the child may continue running.
+If this is undesirable, reap can take care of aborting the subprocesses
+by sending fatal signals to them.
+
+For example, if your run
+
+  (sleep 3; echo foo) & wait
+
+from the shell command-line, and quickly press Ctrl-<C>, in may cases `foo'
+will be printed 2 seconds later, because the SIGINT was not delivered to the
+`sleep' subprocess. This can be triggered more reliably in shell scripts
+running `wait', or like this from the command-line:
+
+  sh -c '(sleep 3; echo foo) & wait'
+
+Use reap to abort all subprocesses on Ctrl-<C>:
+
+  reap sh -c '(sleep 3; echo foo) & wait'
+
+Please note that on many systems the `alarm' command is also available and
+it is similar to `reap'. However, the alarm command won't try to abort
+subprocesses if the main program has already exited. So for example:
+
+  alarm 0 sh -c '(sleep 1; echo foo) &'
+
+will print `foo' after 1 second, but with reap it won't:
+
+  reap sh -c '(sleep 1; echo foo) &'
+
+Please note that both reap and alarm will eventually (after 1 second) send
+SIGKILL if processes don't exit for the SIGALRM or SIGTERM.
+
+Use case 3: Running with timeout
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+reap can be used as a more relialable replacement of the `alarm' command to
+run a process tree with a timeout. For example, both of these command will
+print only `foo' (because it's too late to print `bar'):
+
+  alarm 1 sh -c 'echo foo; (sleep 4; echo bar) & wait'
+  reap --timeout=1 sh -c 'echo foo; (sleep 5; echo bar) & wait'
+
+However, with reap the entire pipeline will finish in less than 1.1 second
+(and with alarm it would be 2 seconds), because reap is more eager to check
+whether the subprocesses have already exited.
+
+Please note that both reap and alarm will eventually (after 1 second) send
+SIGKILL if processes don't exit for the SIGALRM or SIGTERM.
+
+Best practices for writing shell scripts
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In shell scripts (and in non-interactive shells such as `sh -c ...'), the
+shell progress ignores SIGINT and SIGQUIT while it is running an external
+command. This applies to /bin/bash, /bin/dash, /bin/zsh, and possibly to
+other Unix shells as well.
+
+Thus if you run a shell script named prog which runs an external command
+prog2 (in a subprocess), and prog2 ignores SIGINT, then nothing will happen
+when you press Ctrl-<C>: prog2 ignores SIGINT, and the shell is ignoring
+SIGINT while an external command is running.
+
+(1) If at this point you manually send a SIGTERM to the shell (prog), then
+prog2 will continue running. (2) If instead you send a SIGTERM to prog2,
+then it will most probably abort soon, and the shell script will continue
+running, ignoring the failure of prog2. Neither of these is desirable. To
+fix (1), run prog with reap, and send your signal (e.g. SIGINT, SIGQUIT or
+SIGTERM) to the reap process, which will send a SIGTERM to all subprocesses
+in the process group. To fix (2), start all your shell scripts with
+`set -e', which makes the script exit as soon as an external command has
+exited with non-0 status (e.g. aborted by a signal).
+
+Please note that `set -e' is not foolproof, it may get ignored in subshells.
+So instead of writing
+
+  (foo; bar) >out.txt
+
+write
+
+  (foo && bar) >out.txt || exit "$?"
+
+But `set -e' does the trick everything else (i.e. outside parentheses in the
+shell script).
+
+System requirements
+~~~~~~~~~~~~~~~~~~~
+reap needs a Unix system with Python 2.4, 2.5, 2.6 or 2.7. It doesn't work
+with Python >= 3.0.
+
+Installation
+^^^^^^^^^^^^
+Install Python 2.4, 2.5, 2.6 or 2.7, download the reap script, and put it
+somewhere one your $PATH.
+"""
+
+import errno
+import os
+import signal
+import sys
+import time
+
+
+def log(msg):
+  try:
+    os.write(2, msg)
+  except OSError, e:
+    pass
+
+
+got_sig = [None]
+
+
+def handler_func(sig, *args):
+  if got_sig[-1] is None:
+    got_sig[-1] = sig
+
+
+def do_child(cmd):
+  os.setpgrp()
+  try:
+    os.execvp(cmd[0], cmd)
+  except OSError, e:
+    log('reap exec: %s: %s\n' % (cmd[0], os.strerror(e[0])))
+    os._exit(127)  # Will be propagated to do_parent.
+
+
+def kill_ignore(pid, sig):
+  try:
+    os.kill(pid, sig)
+    return True
+  except OSError, e:
+    if e[0] != errno.ESRCH:  # No such process.
+      raise
+    return False
+
+
+def get_handler(handler_str):
+  if handler_str in (None, 'no'):
+    return signal.SIG_IGN
+  else:
+    return handler_func
+  signal.signal(signal.SIGALRM, handler)
+  signal.signal(signal.SIGTERM, handler)
+  signal.signal(signal.SIGQUIT, handler)
+
+
+SIG_TO_NUM = {'int': signal.SIGINT, 'term': signal.SIGTERM,
+              'alrm': signal.SIGALRM, 'quit': signal.SIGQUIT}
+
+
+def map_sig(config, sig):
+  if sig == signal.SIGINT:
+    sig = SIG_TO_NUM.get(config.get('int', 'int'), signal.SIGINT)
+  elif sig == signal.SIGTERM:
+    sig = SIG_TO_NUM.get(config.get('term', 'term'), signal.SIGTERM)
+  elif sig == signal.SIGALRM:
+    sig = SIG_TO_NUM.get(config.get('alrm', 'alrm'), signal.SIGALRM)
+  elif sig == signal.SIGQUIT:
+    sig = SIG_TO_NUM.get(config.get('quit', 'quit'), signal.SIGQUIT)
+  return sig
+
+
+SIGKILL_MSG = 'reap info: SIGTERM timed out, sending SIGKILL.\n'
+
+
+def do_parent(config, child_pid):
+  signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+  signal.signal(signal.SIGINT,  get_handler(config.get('int')))
+  signal.signal(signal.SIGALRM, get_handler(config.get('alrm')))
+  signal.signal(signal.SIGTERM, get_handler(config.get('term')))
+  signal.signal(signal.SIGQUIT, get_handler(config.get('quit')))
+  if config.get('timeout', 0) > 0:
+    signal.alarm(config['timeout'])
+  pid = status = force_sig = None
+  while 1:
+    try:
+      pid, status = os.waitpid(child_pid, 0)
+      break
+    except OSError, e:
+      if e[0] != errno.EINTR:
+        raise
+      if got_sig[-1] is not None:
+        force_sig = map_sig(config, got_sig[-1])
+        break
+  signal.signal(signal.SIGINT,  signal.SIG_IGN)
+  signal.signal(signal.SIGALRM, signal.SIG_IGN)
+  signal.signal(signal.SIGTERM, signal.SIG_IGN)
+  signal.signal(signal.SIGQUIT, signal.SIG_IGN)
+  had_kill = False
+  if pid is None:
+    # Background processes are also part of process group child_pid.
+    kill_ignore(-child_pid, force_sig)
+    had_alarm = [0]
+    if config.get('kill_timeout', 0) > 0:
+      signal.signal(signal.SIGALRM, lambda *args: had_alarm.append(1))
+      signal.alarm(config['kill_timeout'])
+    while 1:
+      try:
+        pid, status = os.waitpid(child_pid, 0)
+        break
+      except OSError, e:
+        if e[0] != errno.EINTR:
+          raise
+        if had_alarm[-1]:
+          log(SIGKILL_MSG)
+          del had_alarm[1:]
+          signal.signal(signal.SIGALRM, signal.SIG_IGN)  # Not needed.
+          force_sig = signal.SIGKILL
+          kill_ignore(-child_pid, force_sig)
+          had_kill = True
+  assert pid == child_pid
+  if force_sig is None:
+    sub_sig = signal.SIGTERM
+  else:
+    sub_sig = force_sig
+  # <prog> has exited, but other subprocesses may still be running. Kill them.
+  if not had_kill and kill_ignore(-child_pid, sub_sig):
+    needs_sigkill = False
+    signal.alarm(0)
+    if config.get('kill_timeout', 0) > 0:
+      target = time.time() + config['kill_timeout']
+    else:
+      target = None
+    time.sleep(0.01)  # Small amount to let the kernel clean up.
+    while kill_ignore(-child_pid, sub_sig):
+      if target is not None and time.time() >= target:
+        log(SIGKILL_MSG)
+        sub_sig = signal.SIGKILL
+        kill_ignore(-child_pid, sub_sig)
+        break
+      time.sleep(0.05)
+  if os.WIFSIGNALED(status):
+    if force_sig is not None:
+      sig = force_sig
+    else:
+      sig = os.WTERMSIG(status)
+    if sig != signal.SIGKILL:
+      signal.signal(sig, signal.SIG_DFL)
+    os.kill(os.getpid(), sig)
+  elif os.WIFEXITED(status):
+    os._exit(os.WEXITSTATUS(status))
+  else:
+    log('fatal: unexpected status=0x%x' % status)
+    os._exit(121)
+
+
+def usage():
+  log('Usage: %s [<flag> ...] <prog> [<arg>...]\n' % sys.argv[0] +
+      'Executes <prog> in a process group, '
+      'and forcibly delivers fatal signals.\n'
+      'Flags:\n'
+      '--int={no|int|term}   Propagate SIGINT (^C) as. Default: term.\n'
+      '--quit={no|alrm|term} Propagate SIGQUIT (^\\) as. Default: alrm.\n'
+      '--alrm={no|term}      Propagate SIGALRM as. Default: term.\n'
+      '--kill-timeout=<int>  Max seconds between SIGTERM and SIGKILL sent. '
+      'Default: 1\n'
+      '--timeout=<int>       Seconds before SIGALRM propagated. '
+      'Default: 0 (no)\n')
+
+
+SIGNAMES = ('no', 'int', 'term', 'quit', 'alrm')
+
+signal.alarm(0)
+config = {
+  'int': 'term',
+  'quit': 'term',
+  'alrm': 'alrm',
+  'kill_timeout': 1,
+  'timeout': 0,
+}
+i = 1
+while i < len(sys.argv):
+  arg = sys.argv[i]
+  i += 1
+  if arg == '-' or not arg.startswith('-'):
+    i -= 1
+    break
+  if arg == '--':
+    break
+  arg = arg.lstrip('-')
+  if arg in ('help', 'h', '?'):
+    usage()
+    os._exit(0)
+  elif arg.startswith('int='):
+    value = arg[arg.find('=') + 1:]
+    if value in SIGNAMES:
+      config['int'] = value
+      continue
+  elif arg.startswith('quit='):
+    value = arg[arg.find('=') + 1:]
+    if value in SIGNAMES:
+      config['quit'] = value
+      continue
+  elif arg.startswith('alrm='):
+    value = arg[arg.find('=') + 1:]
+    if value in SIGNAMES:
+      config['alrm'] = value
+      continue
+    value = arg[arg.find('=') + 1:]
+  elif arg.startswith('kill-timeout='):
+    value = arg[arg.find('=') + 1:]
+    try:
+      config['kill_timeout'] = int(value)
+      continue
+    except ValueError:
+      pass
+  elif arg.startswith('timeout='):
+    value = arg[arg.find('=') + 1:]
+    try:
+      config['timeout'] = int(value)
+      continue
+    except ValueError:
+      pass
+  else:
+    log('fatal: Unknown flag: --%s\n' % arg)
+    os._exit(1)
+  log('fatal: Invalid flag: --%s\n' % arg)
+  os._exit(1)
+if config['timeout'] > 0 and config['alrm'] == 'no':
+  log('fatal: Positive --timeout= and --alrm=no are incompatible.\n')
+  os._exit(1)
+if i >= len(sys.argv):
+  log('fatal: Missing program name.\n')
+  if i == 1:
+    usage()
+  os._exit(1)
+
+
+signal.signal(signal.SIGALRM, signal.SIG_DFL)
+signal.signal(signal.SIGINT,  signal.SIG_DFL)
+signal.signal(signal.SIGQUIT, signal.SIG_DFL)
+signal.signal(signal.SIGTERM, signal.SIG_DFL)
+pid = os.fork()
+if pid:
+  do_parent(config, pid)
+else:
+  do_child(sys.argv[i:])
+# No other code must be added here, in case do_child() returns.
